@@ -25,6 +25,12 @@ export function assertIosMixedContentSmokeResult(result) {
     );
   }
 
+  if (result.phase === "complete" && result.ok !== true) {
+    throw new Error(
+      `iOS mixed-content smoke completed unsuccessfully: ${resultJson(result)}`,
+    );
+  }
+
   if (!isSupportedIosWebViewOrigin(result.webViewOrigin)) {
     throw new Error(
       `iOS mixed-content smoke ran from an unsupported WebView origin: ${resultJson(result)}`,

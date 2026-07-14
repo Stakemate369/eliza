@@ -6,6 +6,8 @@ import { assertIosMixedContentSmokeResult } from "./ios-mixed-content-smoke-cont
 
 function validResult(overrides = {}) {
   return {
+    phase: "complete",
+    ok: true,
     webViewOrigin: "capacitor://localhost",
     mixedContentWouldBlockWebSocket: false,
     webSocketConstructorCalls: [],
@@ -38,6 +40,12 @@ describe("assertIosMixedContentSmokeResult", () => {
         validResult({ webViewOrigin: "http://localhost" }),
       ),
     ).toThrow(/unsupported WebView origin/);
+  });
+
+  it("rejects a terminal unsuccessful result", () => {
+    expect(() =>
+      assertIosMixedContentSmokeResult(validResult({ ok: false })),
+    ).toThrow(/completed unsuccessfully/);
   });
 
   it("rejects WebSocket construction even on capacitor://localhost", () => {
