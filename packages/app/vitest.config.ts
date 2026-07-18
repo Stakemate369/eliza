@@ -37,5 +37,17 @@ export default defineConfig({
     setupFiles: [path.join(here, "test/setup.ts")],
     include: ["src/**/*.test.{ts,tsx}", "test/**/*.test.{ts,tsx}"],
     exclude: unitExcludes,
+    coverage: {
+      ...baseConfig.test?.coverage,
+      // These release/device modules are production code exercised by the
+      // package's Vitest lane, so policy changes emit real LCOV instead of
+      // relying on source-string assertions.
+      include: [
+        "src/**/*.ts",
+        "scripts/ios-cloud-onboarding-smoke.mjs",
+        "scripts/ios-store-engine-gate.mjs",
+        "scripts/mobile-release-preflight.mjs",
+      ],
+    },
   },
 });
