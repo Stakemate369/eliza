@@ -41,23 +41,30 @@ mock.module("../utils/logger", () => ({
   },
 }));
 
-const { requireUserOrApiKey, requireUserOrApiKeyWithOrg } = await import("./workers-hono-auth");
+const { requireApiKeyCredential, requireUserOrApiKey, requireUserOrApiKeyWithOrg } = await import(
+  "./workers-hono-auth"
+);
 
-function contextWithApiKey(apiKey: string) {
+function contextWithHeaders(headers: Record<string, string>) {
   const state = new Map<string, unknown>();
   return {
     env: {},
     executionCtx: { waitUntil: mock(() => undefined) },
     req: {
       url: "https://api.example.test/v1/models",
-      header: (name: string) => (name.toLowerCase() === "x-api-key" ? apiKey : null),
+      header: (name: string) => headers[name.toLowerCase()] ?? null,
     },
     get: (key: string) => state.get(key),
     set: (key: string, value: unknown) => state.set(key, value),
   };
 }
 
+function contextWithApiKey(apiKey: string) {
+  return contextWithHeaders({ "x-api-key": apiKey });
+}
+
 beforeEach(() => {
+  validateApiKey.mockClear();
   validateBehavior = async () => {
     throw new Error("database unavailable");
   };
@@ -101,5 +108,60 @@ describe("Workers API-key auth", () => {
       status: 401,
       code: "authentication_required",
     });
+  });
+
+  test("the exact-credential guard rejects missing and JWT session auth", async () => {
+    await expect(requireApiKeyCredential(contextWithHeaders({}) as never)).rejects.toMatchObject({
+      status: 401,
+      code: "authentication_required",
+    });
+    await expect(
+      requireApiKeyCredential(
+        contextWithHeaders({ authorization: "Bearer header.payload.signature" }) as never,
+      ),
+    ).rejects.toMatchObject({ status: 401, code: "authentication_required" });
+    expect(validateApiKey).not.toHaveBeenCalled();
+  });
+
+  test("the exact-credential guard rejects ambiguous API-key headers", async () => {
+    await expect(
+      requireApiKeyCredential(
+        contextWithHeaders({
+          authorization: "Bearer eliza_bearer_key",
+          "x-api-key": "eliza_header_key",
+        }) as never,
+      ),
+    ).rejects.toMatchObject({ status: 401, code: "authentication_required" });
+    expect(validateApiKey).not.toHaveBeenCalled();
+  });
+
+  test("the exact-credential guard records the ID proven by the presented key", async () => {
+    const validated = {
+      id: "11111111-1111-4111-8111-111111111111",
+      key_hash: "a".repeat(64),
+      is_active: true,
+      expires_at: new Date(Date.now() + 60_000),
+    };
+    validateBehavior = async () => validated;
+    const context = contextWithHeaders({ authorization: "Bearer eliza_exact_key" });
+
+    expect(await requireApiKeyCredential(context as never)).toBe(validated);
+    expect(context.get("authMethod")).toBe("api_key");
+    expect(context.get("apiKeyId")).toBe(validated.id);
+    expect(validateApiKey).toHaveBeenCalledWith("eliza_exact_key");
+  });
+
+  test("the exact-credential guard distinguishes an invalid key from storage outage", async () => {
+    validateBehavior = async () => null;
+    await expect(
+      requireApiKeyCredential(contextWithApiKey("eliza_invalid") as never),
+    ).rejects.toMatchObject({ status: 401, code: "authentication_required" });
+
+    validateBehavior = async () => {
+      throw new Error("database unavailable");
+    };
+    await expect(
+      requireApiKeyCredential(contextWithApiKey("eliza_valid_shape") as never),
+    ).rejects.toMatchObject({ status: 503, code: "service_unavailable" });
   });
 });
