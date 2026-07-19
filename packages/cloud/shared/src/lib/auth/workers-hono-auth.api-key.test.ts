@@ -5,25 +5,16 @@
  * a null return (genuinely invalid key) stays a 401.
  */
 
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 
 let validateBehavior: () => Promise<unknown> = async () => {
   throw new Error("database unavailable");
 };
-const validateApiKey = mock(() => validateBehavior());
-
-mock.module("../services/api-keys", () => ({
-  apiKeysService: {
-    validateApiKey,
-    incrementUsageDebounced: mock(async () => undefined),
-  },
-}));
-
-mock.module("../services/users", () => ({
-  usersService: {
-    getWithOrganization: mock(async () => null),
-  },
-}));
+const { apiKeysService } = await import("../services/api-keys");
+const { usersService } = await import("../services/users");
+let validateApiKey: ReturnType<typeof spyOn>;
+let incrementUsageDebounced: ReturnType<typeof spyOn>;
+let getWithOrganization: ReturnType<typeof spyOn>;
 
 mock.module("./steward-client", () => ({
   verifyStewardTokenCached: mock(async () => null),
@@ -36,14 +27,20 @@ mock.module("./playwright-test-session", () => ({
 
 mock.module("../utils/logger", () => ({
   logger: {
+    debug: mock(() => undefined),
     error: mock(() => undefined),
+    info: mock(() => undefined),
     warn: mock(() => undefined),
   },
 }));
 
-const { requireApiKeyCredential, requireUserOrApiKey, requireUserOrApiKeyWithOrg } = await import(
-  "./workers-hono-auth"
-);
+const {
+  getCurrentUser,
+  requireApiKeyCredential,
+  requireSessionUserWithOrg,
+  requireUserOrApiKey,
+  requireUserOrApiKeyWithOrg,
+} = await import("./workers-hono-auth");
 
 function contextWithHeaders(headers: Record<string, string>) {
   const state = new Map<string, unknown>();
@@ -64,10 +61,22 @@ function contextWithApiKey(apiKey: string) {
 }
 
 beforeEach(() => {
-  validateApiKey.mockClear();
   validateBehavior = async () => {
     throw new Error("database unavailable");
   };
+  validateApiKey = spyOn(apiKeysService, "validateApiKey").mockImplementation(
+    () => validateBehavior() as never,
+  );
+  incrementUsageDebounced = spyOn(apiKeysService, "incrementUsageDebounced").mockResolvedValue(
+    undefined,
+  );
+  getWithOrganization = spyOn(usersService, "getWithOrganization").mockResolvedValue(null);
+});
+
+afterEach(() => {
+  validateApiKey.mockRestore();
+  incrementUsageDebounced.mockRestore();
+  getWithOrganization.mockRestore();
 });
 
 describe("Workers API-key auth", () => {
@@ -163,5 +172,109 @@ describe("Workers API-key auth", () => {
     await expect(
       requireApiKeyCredential(contextWithApiKey("eliza_valid_shape") as never),
     ).rejects.toMatchObject({ status: 503, code: "service_unavailable" });
+  });
+
+  test("API-key org auth resolves the key owner, records context, and tracks usage", async () => {
+    const validated = {
+      id: "11111111-1111-4111-8111-111111111111",
+      user_id: "22222222-2222-4222-8222-222222222222",
+      key_hash: "a".repeat(64),
+      is_active: true,
+      expires_at: new Date(Date.now() + 60_000),
+    };
+    const user = {
+      id: validated.user_id,
+      email: "mobile-owner@example.test",
+      email_verified: true,
+      organization_id: "33333333-3333-4333-8333-333333333333",
+      organization: {
+        id: "33333333-3333-4333-8333-333333333333",
+        name: "Mobile Org",
+        is_active: true,
+      },
+      is_active: true,
+      role: "member",
+      steward_user_id: "steward-user",
+      wallet_address: null,
+      is_anonymous: false,
+    };
+    validateBehavior = async () => validated;
+    getWithOrganization.mockResolvedValue(user);
+    const context = contextWithApiKey("eliza_live_key");
+
+    await expect(requireUserOrApiKeyWithOrg(context as never)).resolves.toMatchObject({
+      id: user.id,
+      organization_id: user.organization_id,
+    });
+    expect(context.get("authMethod")).toBe("api_key");
+    expect(context.get("apiKeyId")).toBe(validated.id);
+    expect(context.executionCtx.waitUntil).toHaveBeenCalled();
+  });
+
+  test("API-key org auth rejects missing, inactive, and organizationless owners", async () => {
+    const validated = {
+      id: "11111111-1111-4111-8111-111111111111",
+      user_id: "22222222-2222-4222-8222-222222222222",
+      key_hash: "a".repeat(64),
+      is_active: true,
+      expires_at: new Date(Date.now() + 60_000),
+    };
+    validateBehavior = async () => validated;
+
+    getWithOrganization.mockResolvedValueOnce(null);
+    await expect(
+      requireUserOrApiKeyWithOrg(contextWithApiKey("eliza_live_key") as never),
+    ).rejects.toMatchObject({ status: 401 });
+
+    getWithOrganization.mockResolvedValueOnce({
+      id: validated.user_id,
+      is_active: false,
+      organization: { id: "33333333-3333-4333-8333-333333333333", is_active: true },
+    });
+    await expect(
+      requireUserOrApiKeyWithOrg(contextWithApiKey("eliza_live_key") as never),
+    ).rejects.toMatchObject({ status: 403 });
+
+    getWithOrganization.mockResolvedValueOnce({
+      id: validated.user_id,
+      is_active: true,
+      organization_id: null,
+      organization: null,
+    });
+    await expect(
+      requireUserOrApiKeyWithOrg(contextWithApiKey("eliza_live_key") as never),
+    ).rejects.toMatchObject({ status: 403 });
+  });
+
+  test("session-only API-key management rejects API keys and accepts cached sessions", async () => {
+    await expect(
+      requireSessionUserWithOrg(contextWithApiKey("eliza_live_key") as never),
+    ).rejects.toMatchObject({
+      status: 401,
+      code: "session_auth_required",
+    });
+
+    const context = contextWithHeaders({});
+    context.set("user", {
+      id: "22222222-2222-4222-8222-222222222222",
+      organization_id: "33333333-3333-4333-8333-333333333333",
+      organization: {
+        id: "33333333-3333-4333-8333-333333333333",
+        name: "Session Org",
+        is_active: true,
+      },
+      is_active: true,
+    });
+    context.set("authMethod", "session");
+    await expect(requireSessionUserWithOrg(context as never)).resolves.toMatchObject({
+      organization_id: "33333333-3333-4333-8333-333333333333",
+    });
+  });
+
+  test("getCurrentUser caches null when no Steward token is present", async () => {
+    const context = contextWithHeaders({});
+    await expect(getCurrentUser(context as never)).resolves.toBeNull();
+    await expect(getCurrentUser(context as never)).resolves.toBeNull();
+    expect(context.get("user")).toBeNull();
   });
 });
